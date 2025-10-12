@@ -34,10 +34,14 @@ export default function RecurringPage() {
     (async () => {
       try {
         const { data, error } = await supabase
-          .from<RecurringRow>('recurring_summary')
-          .select('*')
-          .order('estimated_monthly_cost', { ascending: false })
-          .limit(100);
+  .from('recurring_summary')
+  .select('*')
+  .order('estimated_monthly_cost', { ascending: false })
+  .limit(100);
+
+// optional: if you want to use the RecurringRow type for TS checks below
+const rows = data as RecurringRow[] | null;
+
 
         if (error) throw error;
         if (mounted) setRows(data ?? []);
