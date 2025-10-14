@@ -1,0 +1,13 @@
+# Import API — /api/import
+
+Endpoint: `POST https://budget-micro-saas.vercel.app/api/import`
+
+Authentication:
+- Required header: `x-api-key: <IMPORT_API_KEY>`
+- The key is stored as the environment variable `IMPORT_API_KEY` in Vercel (do not commit the key to GitHub).
+
+Request body (JSON):
+- `staging_id` (number) — ID from `staging_import` to process
+- Optional: `date_raw`, `transaction_type`, `amount_raw`, `description` — these are accepted by the endpoint
+
+Example `curl`:
