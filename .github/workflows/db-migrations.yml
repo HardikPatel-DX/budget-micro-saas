@@ -8,8 +8,6 @@ on:
 jobs:
   migrate:
     runs-on: ubuntu-latest
-    env:
-      PGPASSFILE: ${{ runner.temp }}/pgpass
 
     steps:
       - name: Checkout
@@ -20,11 +18,6 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y postgresql-client
 
-      - name: Validate required secret
-        if: ${{ secrets.DATABASE_URL == '' }}
-        run: |
-          echo "Missing DATABASE_URL secret" && exit 1
-
       - name: List migrations
         run: |
           echo "Migrations to apply:"
@@ -34,8 +27,14 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
+          # Fail fast if DATABASE_URL is not set (avoid YAML expression validation issues)
+          if [ -z "${DATABASE_URL}" ]; then
+            echo "Missing DATABASE_URL secret" >&2
+            exit 1
+          fi
+
           set -euo pipefail
-          for f in $(ls db/migrations/*.sql | sort); do
+          for f in $(ls db/migrations/*.sql 2>/dev/null | sort); do
             echo "Applying $f"
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
           done
