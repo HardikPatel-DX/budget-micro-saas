@@ -1,4 +1,29 @@
-name: Run migrations
+name: Run DB migrations
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install libpq (psql)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
+      - name: List migrations
+        run: |
+          echo "Migrations to apply:"
+          ls -1 db/migrations || (echo "No migrations found" && exit 0)
+
+      - name: Run migrations
   env:
     DATABASE_URL: ${{ secrets.DATABASE_URL }}
     PGSSLMODE: require
