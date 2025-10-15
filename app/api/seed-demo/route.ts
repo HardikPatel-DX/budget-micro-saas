@@ -3,11 +3,17 @@ import { NextResponse } from 'next/server';
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const SEED_DEMO_KEY = process.env.SEED_DEMO_KEY || '';
 
 export async function POST(req: Request) {
   try {
-    // You may want to verify session / user here via cookies or Authorization if needed.
-    // This demo data is intentionally simple — adjust or extend as needed.
+    // Simple API-key guard (header: x-seed-key)
+    const reqKey = req.headers.get('x-seed-key') || '';
+    if (!SEED_DEMO_KEY || reqKey !== SEED_DEMO_KEY) {
+      return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // Demo data (keep or extend)
     const demoData = [
       { date_raw: '2025-09-01', transaction_type: 'Card', amount_raw: '-25.00', description: 'Coffee' },
       { date_raw: '2025-09-02', transaction_type: 'Card', amount_raw: '-120.00', description: 'Groceries' },
