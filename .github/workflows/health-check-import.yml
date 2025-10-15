@@ -1,0 +1,41 @@
+name: Health Check — /api/import
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  import-health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check - call /api/import
+        env:
+          IMPORT_API_KEY: ${{ secrets.IMPORT_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${IMPORT_API_KEY:-}" ]; then
+            echo "Missing IMPORT_API_KEY secret" >&2
+            exit 1
+          fi
+
+          RESP="$(curl -s -w '\nHTTP_STATUS:%{http_code}' -X POST "https://budget-micro-saas.vercel.app/api/import" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${IMPORT_API_KEY}" \
+            -d '{"staging_id":0, "description":"health-check"}')"
+
+          STATUS="$(echo "$RESP" | tr '\r' '\n' | sed -n 's/^HTTP_STATUS://p' | tail -n1)"
+          BODY="$(echo "$RESP" | sed '/HTTP_STATUS:/,$d' )"
+
+          echo "HTTP status: $STATUS"
+          echo "Response body: $BODY"
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check FAILED (status $STATUS)" >&2
+            exit 1
+          fi
+
+          echo "Health check OK"
