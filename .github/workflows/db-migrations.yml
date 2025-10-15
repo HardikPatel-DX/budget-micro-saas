@@ -26,8 +26,9 @@ jobs:
       - name: Run migrations
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGSSLMODE: require
         run: |
-          # Fail fast if DATABASE_URL is not set (avoid YAML expression validation issues)
+          # Fail fast if DATABASE_URL is not set
           if [ -z "${DATABASE_URL}" ]; then
             echo "Missing DATABASE_URL secret" >&2
             exit 1
