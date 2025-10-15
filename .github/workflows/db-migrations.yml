@@ -24,17 +24,18 @@ jobs:
           ls -1 db/migrations || (echo "No migrations found" && exit 0)
 
       - name: Run migrations
-  env:
-    DATABASE_URL: ${{ secrets.DATABASE_URL }}
-    PGSSLMODE: require
-  run: |
-    if [ -z "${DATABASE_URL}" ]; then
-      echo "Missing DATABASE_URL secret" >&2
-      exit 1
-    fi
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGSSLMODE: require
+        run: |
+          # Fail fast if DATABASE_URL is not set
+          if [ -z "${DATABASE_URL}" ]; then
+            echo "Missing DATABASE_URL secret" >&2
+            exit 1
+          fi
 
-    set -euo pipefail
-    for f in $(ls db/migrations/*.sql 2>/dev/null | sort); do
-      echo "Applying $f"
-      psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
-    done
+          set -euo pipefail
+          for f in $(ls db/migrations/*.sql 2>/dev/null | sort); do
+            echo "Applying $f"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
