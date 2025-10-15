@@ -1,0 +1,28 @@
+# Import API — /api/import
+
+Endpoint: `POST https://budget-micro-saas.vercel.app/api/import`
+
+Authentication:
+- Required header: `x-api-key: <IMPORT_API_KEY>`
+- The key is stored as the environment variable `IMPORT_API_KEY` in Vercel (do not commit the key to GitHub).
+
+Request body (JSON):
+- `staging_id` (number) — ID from `staging_import` to process
+- Optional: `date_raw`, `transaction_type`, `amount_raw`, `description` — these are accepted by the endpoint
+
+Example `curl`:
+
+curl -i -X POST "https://budget-micro-saas.vercel.app/api/import"
+-H "Content-Type: application/json"
+-H "x-api-key: <YOUR_KEY_HERE>"
+-d '{"staging_id":381}'
+
+
+Response:
+- `200 OK` — `{ "ok": true, "inserted": [ ... ] }`
+- `401 Unauthorized` — missing or invalid `x-api-key`
+- `500` — server error (check Vercel logs)
+
+Notes:
+- Keep `IMPORT_API_KEY` secret. Rotate it immediately if exposed.
+- For automated calls (CI, scheduled imports), store the key in the caller's safe secret store (GitHub Actions secrets, server env, etc).
