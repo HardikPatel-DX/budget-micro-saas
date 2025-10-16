@@ -1,4 +1,3 @@
-// app/head.tsx
 export default function Head() {
   const GA = process.env.NEXT_PUBLIC_GA_MEASUREMENT_ID;
   return (

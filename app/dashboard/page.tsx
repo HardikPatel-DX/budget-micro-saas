@@ -25,7 +25,7 @@ export default function DashboardPage() {
       try {
         const { data, error } = await supabase
           .from('transactions')
-          .select('id, date, amount, description, processed')
+          .select('id, date, amount, description, processed, created_at')
           .order('created_at', { ascending: false })
           .limit(20);
         if (error) throw error;
@@ -40,7 +40,6 @@ export default function DashboardPage() {
     return () => { cancelled = true; };
   }, [supabase]);
 
-  // minimal summary metrics computed client-side from fetched rows
   const total = txs.reduce((s, t) => s + Number(t.amount || 0), 0);
   const avg = txs.length ? (total / txs.length) : 0;
 
