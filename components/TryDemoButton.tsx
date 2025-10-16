@@ -1,15 +1,31 @@
 'use client';
 import { useState } from 'react';
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs';
 
 export default function TryDemoButton() {
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const supabase = createClientComponentClient();
 
   const onClick = async () => {
     setLoading(true);
     setMsg(null);
     try {
-      const res = await fetch('/api/seed-demo-trigger', { method: 'POST' });
+      // get current session & access token
+      const { data } = await supabase.auth.getSession();
+      const token = data?.session?.access_token;
+      if (!token) {
+        throw new Error('Not signed in — please sign in first.');
+      }
+
+      const res = await fetch('/api/seed-demo-trigger', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+      });
+
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error || 'seed failed');
       setMsg('Demo data seeded ✅');
