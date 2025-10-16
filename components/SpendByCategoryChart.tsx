@@ -30,8 +30,10 @@ export default function SpendByCategoryChart() {
           throw new Error(json?.error || 'failed to load');
         }
         if (mounted) {
-          // convert totals to absolute numbers suitable for chart (positive numbers)
-          const d = (json.data || []).map((r: any) => ({ category: r.category, total: Math.abs(Number(r.total) || 0) }));
+          const d: DataPoint[] = (json.data || []).map((r: any) => ({
+            category: String(r.category || 'Uncategorized'),
+            total: Math.abs(Number(r.total || 0))
+          }));
           setData(d);
         }
       } catch (err: any) {
@@ -59,13 +61,14 @@ export default function SpendByCategoryChart() {
             cx="50%"
             cy="50%"
             outerRadius={100}
-            label={(entry) => `${entry.category} (${entry.total.toFixed(2)})`}
+            // ensure entry.total is a number before calling toFixed
+            label={(entry: any) => `${String(entry.category)} (${Number(entry.total).toFixed(2)})`}
           >
             {data.map((entry, index) => (
               <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
             ))}
           </Pie>
-          <Tooltip />
+          <Tooltip formatter={(value: any) => (typeof value === 'number' ? value.toFixed(2) : String(value))} />
           <Legend />
         </PieChart>
       </ResponsiveContainer>
