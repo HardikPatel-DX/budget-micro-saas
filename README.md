@@ -34,3 +34,18 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## /dashboard and API (feat/dashboard)
+
+Added `/dashboard` dark theme page and `/api/dashboard-summary` owner-aware API.
+
+Environment variables required on Vercel:
+- NEXT_PUBLIC_SUPABASE_URL
+- NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+Important:
+- Do NOT expose Supabase SERVICE_ROLE key to client or NEXT_PUBLIC vars.
+- API expects the user's JWT (the client passes it via Authorization header automatically).
+- Server caches responses for 5 minutes.
+
+Testing hint: use your existing seed-demo flow, import a staging row (example: `staging_id 381` -> `transaction_id 379`) and confirm the transaction shows up in the dashboard.
