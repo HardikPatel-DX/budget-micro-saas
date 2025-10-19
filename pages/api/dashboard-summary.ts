@@ -292,20 +292,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }));
 
     // Recurring sparklines (12 points) for up to top 10 recurring payees
-    const recurringSparklines = (recurringData || []).slice(0, 10).map(r => {
-      const related = transactions.filter(t => (t.payee || '').toLowerCase().includes((r.payee || '').toLowerCase()));
+        // Recurring sparklines (12 points) for up to top 10 recurring payees
+    const recurringSparklines = (recurringData || []).slice(0, 10).map((r: any) => {
+      // only include transactions that have a date and match the payee (case-insensitive)
+      const related = transactions.filter(
+        (t: any) =>
+          t.date && (t.payee || '').toLowerCase().includes((r.payee || '').toLowerCase())
+      );
+
       const points: number[] = [];
       const periods = 12;
+
       if (r.frequency === 'weekly') {
+        // compute this week Monday as start
         const thisWeekStart = new Date();
         const day = (thisWeekStart.getDay() + 6) % 7;
         thisWeekStart.setDate(thisWeekStart.getDate() - day);
+        thisWeekStart.setHours(0, 0, 0, 0);
+
         for (let i = periods - 1; i >= 0; i--) {
           const start = new Date(thisWeekStart);
           start.setDate(start.getDate() - i * 7);
           const end = new Date(start);
           end.setDate(end.getDate() + 7);
-          const sum = related.filter(t => t.date >= start && t.date < end).reduce((s, t) => s + Math.abs(t.amount), 0);
+
+          // TypeScript: use non-null assertion because 'related' was filtered for t.date
+          const sum = related
+            .filter((t: any) => (t.date as Date) >= start && (t.date as Date) < end)
+            .reduce((s: number, t: any) => s + Math.abs(t.amount), 0);
+
           points.push(Number(sum.toFixed(2)));
         }
       } else {
@@ -313,10 +328,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         for (let i = periods - 1; i >= 0; i--) {
           const start = new Date(nowM.getFullYear(), nowM.getMonth() - i, 1);
           const end = new Date(start.getFullYear(), start.getMonth() + 1, 1);
-          const sum = related.filter(t => t.date >= start && t.date < end).reduce((s, t) => s + Math.abs(t.amount), 0);
+
+          const sum = related
+            .filter((t: any) => (t.date as Date) >= start && (t.date as Date) < end)
+            .reduce((s: number, t: any) => s + Math.abs(t.amount), 0);
+
           points.push(Number(sum.toFixed(2)));
         }
       }
+
       return { payee: r.payee, points };
     });
 
