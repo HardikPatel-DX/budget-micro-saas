@@ -35,12 +35,11 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_ANON) {
-  // Runtime warn — API won't work properly without these envs
+  // Warn at module load time — handler will still respond with 500 if missing
   console.warn('Missing SUPABASE env vars for dashboard-summary API.');
 }
 
 function isoWeekStart(d: Date) {
-  // get Monday as week start
   const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   const day = date.getUTCDay(); // 0=Sun
   const diff = (day + 6) % 7; // days since Monday
@@ -56,27 +55,31 @@ function safeNum(v: any) {
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse | { error: string }>) {
   try {
-    // Caching: server-side short cache (5 minutes)
-    // If you have caching infra (Vercel), set cache headers. For now, 5 minutes via header.
+    // Cache header (server-side caching)
     res.setHeader('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=60');
 
-    // Extract bearer token from incoming request
+    // Extract bearer token
     const authHeader = (req.headers.authorization as string) || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader || null;
     if (!token) {
       return res.status(401).json({ error: 'Missing Authorization Bearer token' });
     }
+
+    // Ensure Supabase envs present at runtime - return early so TS can narrow
     if (!SUPABASE_URL || !SUPABASE_ANON) {
       return res.status(500).json({ error: 'Missing Supabase configuration on server' });
     }
 
+    // Compute base URL now that we've asserted existence so TS accepts it
+    const baseUrl = SUPABASE_URL.replace(/\/$/, '');
+
     // Helper to call PostgREST (supabase REST) — uses anon key + user token so RLS applies
     async function restFetch(path: string) {
-      const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/${path}`;
+      const url = `${baseUrl}/rest/v1/${path}`;
       const r = await fetch(url, {
         method: 'GET',
         headers: {
-          apikey: SUPABASE_ANON,
+          apikey: SUPABASE_ANON!,
           Authorization: `Bearer ${token}`,
           Accept: 'application/json'
         }
@@ -88,21 +91,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return r.json();
     }
 
-    // Fetch recent transactions for this user (PostgREST returns only rows allowed by RLS for that token)
-    // Select only necessary columns; adjust column names if your schema differs.
-    // We'll fetch a reasonable batch (limit 2000) to compute aggregates.
+    // Fetch recent transactions (limit to 2000)
     const rows: any[] = await (async () => {
       try {
-        // order by date_parsed desc then created_at as fallback
         return await restFetch(`transactions?select=transaction_id,amount,date_parsed,created_at,category,payee&order=date_parsed.desc,created_at.desc&limit=2000`);
       } catch (err) {
-        // if table missing or other issue, return empty list
         console.error('restFetch transactions error', err);
         return [];
       }
     })();
 
-    // Normalize rows: use date_parsed fallback to created_at, ignore rows with bad amounts
+    // Normalize rows and filter invalid amounts
     const normalized = rows
       .map(r => {
         const date = (r.date_parsed || r.created_at || null);
@@ -111,10 +110,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       })
       .filter(r => Number.isFinite(r.amount) && !Number.isNaN(r.amount));
 
-    // Current balance: sum of all amounts (simplification; adapt to your logic)
     const currentBalance = normalized.reduce((s, r) => s + r.amount, 0);
 
-    // Weekly series for last 26 weeks
+    // Build weekly buckets for last 26 weeks
     const now = new Date();
     const weeklyBuckets: Record<string, number> = {};
     for (let i = 0; i < 26; i++) {
@@ -128,12 +126,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const wk = isoWeekStart(d);
       if (wk in weeklyBuckets) weeklyBuckets[wk] += r.amount;
     });
-    // produce array ordered oldest -> newest
     const weeklyKeys = Object.keys(weeklyBuckets).sort();
     const weeklySeries26 = weeklyKeys.map(k => ({ weekStart: k, amount: Number(weeklyBuckets[k] || 0) }));
 
-    // Weekly average spend (use negative amounts as spend if positive incomes exist).
-    // Define spend as sum of negative amounts' absolute values per week
+    // Weekly spend avg (absolute negative amounts)
     const weeklySpendValues: number[] = weeklyKeys.map(k => {
       return normalized
         .filter(r => isoWeekStart(new Date(r.date)) === k && r.amount < 0)
@@ -142,12 +138,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const totalSpend = weeklySpendValues.reduce((s, v) => s + v, 0);
     const weeklyAvgSpend26 = weeklySpendValues.length ? totalSpend / weeklySpendValues.length : 0;
 
-    // Monthly net flow (last 30 days vs previous 30 days) — simpler: sum amounts in last 30 days
+    // Monthly net flow (last 30 days)
     const ms30 = 30 * 24 * 3600 * 1000;
     const since = new Date(Date.now() - ms30);
     const monthlyNetFlow = normalized.filter(r => new Date(r.date) >= since).reduce((s, r) => s + r.amount, 0);
 
-    // Top categories and payees
+    // Top categories & payees
     const catMap = new Map<string, number>();
     const payeeMap = new Map<string, number>();
     normalized.forEach(r => {
@@ -158,13 +154,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       .map(([category, amount]) => ({ category, amount }))
       .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount))
       .slice(0, 5);
-
     const topPayees = Array.from(payeeMap.entries())
       .map(([payee, amount]) => ({ payee, amount }))
       .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount))
       .slice(0, 10);
 
-    // Simple recurring detection heuristic: payees with 3+ transactions in last 90 days and similar amounts
+    // Recurring detection (heuristic)
     const recent90 = new Date(Date.now() - 90 * 24 * 3600 * 1000);
     const payeeGroups = new Map<string, any[]>();
     normalized.filter(r => new Date(r.date) >= recent90).forEach(r => {
@@ -176,7 +171,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     payeeGroups.forEach((arr, payee) => {
       if (arr.length >= 3) {
         const avg = arr.reduce((s, t) => s + t.amount, 0) / arr.length;
-        // rough frequency guess by average days between transactions
         const dates = arr.map(a => new Date(a.date).getTime()).sort();
         let avgDeltaDays = 0;
         if (dates.length >= 2) {
@@ -197,9 +191,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       }
     });
 
-    // Upcoming bills: for each recurring item, estimate next date by adding avgDeltaDays
     const upcomingBills = recurring.map(r => {
-      // naive next date: if weekly then +7 else +30; else unknown
       let next: string | null = null;
       const last = r.last_date ? new Date(r.last_date) : null;
       if (last) {
@@ -211,11 +203,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return { payee: r.payee, amount: r.avg_amount, next_date: next };
     });
 
-    // Unmapped payees: from topPayees where no mapping exists — we don't have payee_mapping table query here,
-    // so return top payees' names as "unmapped suggestions" (consumer will handle mapping UI)
     const unmappedPayees = topPayees.slice(0, 10).map(p => p.payee);
 
-    // Savings scenarios: use weekly net flow as baseline (we'll compute weekly net flow as avg of weekly totals)
     const weeklyTotals = weeklyKeys.map(k =>
       normalized.filter(r => isoWeekStart(new Date(r.date)) === k).reduce((s, r) => s + r.amount, 0)
     );
@@ -247,7 +236,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         weeklySeries26,
         categoryDonut: topCategories,
         topPayeesBar: topPayees,
-        recurringSparkline: recurring.slice(0, 1).map(r => Number(r.avg_amount)) // simple sparkline
+        recurringSparkline: recurring.slice(0, 1).map(r => Number(r.avg_amount))
       },
       savingsScenarios: {
         methodUsed: 'weeklyNetFlow (avg of weekly totals)',
