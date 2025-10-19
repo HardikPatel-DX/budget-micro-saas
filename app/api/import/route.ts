@@ -40,15 +40,14 @@ export async function POST(req: Request) {
 
     const url = `${SUPABASE_URL}/rest/v1/staging_import`;
 
-    // Ensure headers are strictly string->string so TS accepts them as HeadersInit
+    // Ensure we pass strictly string values for headers
     const key = SERVICE_ROLE_KEY ?? '';
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      // For Supabase REST, include apikey + Authorization with service role
-      apikey: key,
-      Authorization: `Bearer ${key}`,
-      Prefer: 'return=representation'
-    };
+
+    const headers = new Headers();
+    headers.set('Content-Type', 'application/json');
+    headers.set('apikey', key);
+    headers.set('Authorization', `Bearer ${key}`);
+    headers.set('Prefer', 'return=representation');
 
     const res = await fetch(url, {
       method: 'POST',
