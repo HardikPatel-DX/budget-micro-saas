@@ -67,7 +67,7 @@ function isoDate(d: Date) {
   return d.toISOString().slice(0, 10);
 }
 function isoWeekStart(d: Date) {
-  // Monday as week start
+  // Monday as week start (UTC-based)
   const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   const day = date.getUTCDay(); // 0 = Sun
   const diff = (day + 6) % 7; // days since Monday
@@ -143,7 +143,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     })();
 
     // Normalize rows: date fallback, numeric amounts, fill categories/payees
-    const transactions = (rows || [])
+    const normalized = (rows || [])
       .map((r: any) => {
         const dateRaw = r.date_parsed || r.created_at || null;
         const dateObj = dateRaw ? new Date(dateRaw) : null;
@@ -158,10 +158,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           rawPayee: r.payee_clean || r.payee_norm || (r.description || 'Unknown')
         };
       })
+      // keep only rows that have a valid date and numeric amount
       .filter((t: any) => t.date && typeof t.amount === 'number' && !Number.isNaN(t.amount));
 
+    // Make a typed, non-null-date transactions array to satisfy TypeScript
+    const txs: Array<{
+      id: any;
+      amount: number;
+      date: Date;
+      category: string;
+      payee: string;
+      rawPayee: string;
+    }> = normalized.map(t => ({ ...t, date: t.date as Date }));
+
     // If no transactions, return an empty payload (but cache)
-    if (!transactions || transactions.length === 0) {
+    if (!txs || txs.length === 0) {
       const empty: ApiResponse = {
         cached: false,
         generated_at: new Date().toISOString(),
@@ -185,7 +196,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     // Current balance
-    const currentBalance = transactions.reduce((s: number, t: any) => s + t.amount, 0);
+    const currentBalance = txs.reduce((s: number, t: any) => s + t.amount, 0);
 
     // Weekly series (last 26 weeks) — using absolute spend (negative amounts as spend)
     const now = new Date();
@@ -195,8 +206,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       d.setUTCDate(d.getUTCDate() - i * 7);
       weeklyBuckets[isoWeekStart(d)] = 0;
     }
-    transactions.forEach(t => {
-      const wk = isoWeekStart(t.date as Date);
+    txs.forEach(t => {
+      const wk = isoWeekStart(t.date);
       if (wk in weeklyBuckets) weeklyBuckets[wk] += t.amount < 0 ? Math.abs(t.amount) : 0;
     });
     const weeklyKeys = Object.keys(weeklyBuckets).sort();
@@ -207,12 +218,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     // Monthly net flow (last 30 days)
     const ms30 = 30 * 24 * 3600 * 1000;
     const since = new Date(Date.now() - ms30);
-    const monthlyNetFlow = transactions.filter(t => (t.date as Date) >= since).reduce((s, t) => s + t.amount, 0);
+    const monthlyNetFlow = txs.filter(t => t.date >= since).reduce((s, t) => s + t.amount, 0);
 
     // Top categories and top payees
     const catMap = new Map<string, number>();
     const payeeMap = new Map<string, number>();
-    transactions.forEach(t => {
+    txs.forEach(t => {
       catMap.set(t.category, (catMap.get(t.category) || 0) + t.amount);
       payeeMap.set(t.payee, (payeeMap.get(t.payee) || 0) + t.amount);
     });
@@ -247,8 +258,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (!recurringData || recurringData.length === 0) {
       // Heuristic: find payees with >=3 occurrences in last 90 days and reasonably consistent intervals
       const recent90 = new Date(Date.now() - 90 * 24 * 3600 * 1000);
-            const byPayee = new Map<string, any[]>();
-      transactions.filter(t => (t.date as Date) >= recent90).forEach(t => {
+      const byPayee = new Map<string, typeof txs>();
+      txs.filter(t => t.date >= recent90).forEach(t => {
         const k = (t.payee || 'Unknown') as string;
         const arr = byPayee.get(k) || [];
         arr.push(t);
@@ -257,10 +268,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const heuristics: RecurringOut[] = [];
       for (const [payee, arr] of byPayee.entries()) {
         if (!arr || arr.length < 3) continue;
-        const sorted = arr.slice().sort((a: any, b: any) => (a.date as Date).getTime() - (b.date as Date).getTime());
+        const sorted = arr.slice().sort((a: any, b: any) => a.date.getTime() - b.date.getTime());
         const intervals: number[] = [];
         for (let i = 1; i < sorted.length; i++) {
-          intervals.push(((sorted[i].date as Date).getTime() - (sorted[i - 1].date as Date).getTime()) / (1000 * 60 * 60 * 24));
+          intervals.push((sorted[i].date.getTime() - sorted[i - 1].date.getTime()) / (1000 * 60 * 60 * 24));
         }
         const avgInterval = intervals.reduce((s, n) => s + n, 0) / intervals.length;
         const sd = Math.sqrt(intervals.map(x => (x - avgInterval) ** 2).reduce((s, y) => s + y, 0) / intervals.length);
@@ -268,7 +279,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         if (avgInterval >= 6 && avgInterval <= 40 && sd <= 15) {
           const freq: RecurringOut['frequency'] = avgInterval <= 10 ? 'weekly' : 'monthly';
           const avgAmount = sorted.reduce((s: number, r: any) => s + r.amount, 0) / sorted.length;
-          const lastDate = sorted[sorted.length - 1].date as Date;
+          const lastDate = sorted[sorted.length - 1].date;
           const nextDate = new Date(lastDate);
           nextDate.setDate(nextDate.getDate() + Math.round(avgInterval));
           heuristics.push({
@@ -292,13 +303,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }));
 
     // Recurring sparklines (12 points) for up to top 10 recurring payees
-        // Recurring sparklines (12 points) for up to top 10 recurring payees
     const recurringSparklines = (recurringData || []).slice(0, 10).map((r: any) => {
       // only include transactions that have a date and match the payee (case-insensitive)
-      const related = transactions.filter(
-        (t: any) =>
-          t.date && (t.payee || '').toLowerCase().includes((r.payee || '').toLowerCase())
-      );
+      const related = txs.filter(t => t.date && (t.payee || '').toLowerCase().includes((r.payee || '').toLowerCase()));
 
       const points: number[] = [];
       const periods = 12;
@@ -316,10 +323,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           const end = new Date(start);
           end.setDate(end.getDate() + 7);
 
-          // TypeScript: use non-null assertion because 'related' was filtered for t.date
           const sum = related
-            .filter((t: any) => (t.date as Date) >= start && (t.date as Date) < end)
-            .reduce((s: number, t: any) => s + Math.abs(t.amount), 0);
+            .filter(t => t.date >= start && t.date < end)
+            .reduce((s, t) => s + Math.abs(t.amount), 0);
 
           points.push(Number(sum.toFixed(2)));
         }
@@ -330,8 +336,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           const end = new Date(start.getFullYear(), start.getMonth() + 1, 1);
 
           const sum = related
-            .filter((t: any) => (t.date as Date) >= start && (t.date as Date) < end)
-            .reduce((s: number, t: any) => s + Math.abs(t.amount), 0);
+            .filter(t => t.date >= start && t.date < end)
+            .reduce((s, t) => s + Math.abs(t.amount), 0);
 
           points.push(Number(sum.toFixed(2)));
         }
@@ -351,7 +357,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     // Unmapped payees (top unmatched by frequency)
     const rawCount = new Map<string, number>();
-    transactions.forEach(t => {
+    txs.forEach(t => {
       const key = ((t.rawPayee || '').trim() || (t.payee || '')).trim();
       if (!key) return;
       rawCount.set(key, (rawCount.get(key) || 0) + 1);
@@ -369,7 +375,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     // Savings scenarios: baseline is weekly net flow (last 7 days) else weeklyAvgSpend26
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(now.getDate() - 7);
-    const weeklyNetFlow = transactions.filter(t => t.date >= sevenDaysAgo).reduce((s, t) => s + t.amount, 0);
+    const weeklyNetFlow = txs.filter(t => t.date >= sevenDaysAgo).reduce((s, t) => s + t.amount, 0);
     const methodUsed: ApiResponse['savingsScenarios']['methodUsed'] = weeklyNetFlow !== 0 ? 'weeklyNetFlow' : 'weeklyAvgSpend';
     const baseWeekly = Math.abs(weeklyNetFlow !== 0 ? weeklyNetFlow : -weeklyAvgSpend26);
     const weeklyNetFlowValue = Number(baseWeekly.toFixed(2));
