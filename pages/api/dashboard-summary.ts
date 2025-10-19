@@ -247,11 +247,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (!recurringData || recurringData.length === 0) {
       // Heuristic: find payees with >=3 occurrences in last 90 days and reasonably consistent intervals
       const recent90 = new Date(Date.now() - 90 * 24 * 3600 * 1000);
-      const byPayee = new Map<string, any[]>();
+            const byPayee = new Map<string, any[]>();
       transactions.filter(t => (t.date as Date) >= recent90).forEach(t => {
         const k = (t.payee || 'Unknown') as string;
-        if (!byPayee.has(k)) byPayee.set(k, []);
-        byPayee.get(k).push(t);
+        const arr = byPayee.get(k) || [];
+        arr.push(t);
+        byPayee.set(k, arr);
       });
       const heuristics: RecurringOut[] = [];
       for (const [payee, arr] of byPayee.entries()) {
