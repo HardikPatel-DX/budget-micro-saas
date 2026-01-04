@@ -98,9 +98,10 @@ export async function POST(req: Request) {
 
     // Auth: accept API key via header OR body (keeps current /upload working)
     const headerKey =
-      req.headers.get("x-import-api-key") ||
-      req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
-      "";
+  req.headers.get("x-api-key") ||
+  req.headers.get("x-import-api-key") ||
+  req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+  "";
 
     const body = (await req.json().catch(() => ({}))) as IncomingBody;
 
