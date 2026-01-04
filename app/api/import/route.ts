@@ -1,95 +1,250 @@
 // app/api/import/route.ts
-import { NextResponse } from 'next/server';
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
-/**
- * Protected import route (app router)
- * - Requires header: x-api-key === IMPORT_API_KEY (set in Vercel)
- * - Inserts into staging_import via Supabase REST using service role key (server-only env)
- * - Returns inserted rows (representation) or an error
- *
- * Env required (server):
- * - NEXT_PUBLIC_SUPABASE_URL
- * - SUPABASE_SERVICE_ROLE_KEY
- * - IMPORT_API_KEY
- *
- * NOTE: Never expose the service role key to the browser.
- */
+type IncomingBody = {
+  filename?: string;
+  content?: string; // full CSV/TSV text
+  importApiKey?: string; // optional (some clients send it here)
+  apiKey?: string; // optional
+};
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const IMPORT_API_KEY = process.env.IMPORT_API_KEY || '';
-
-if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
-  console.warn('Missing SUPABASE env vars in server environment.');
+function norm(s: string) {
+  return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
 }
-if (!IMPORT_API_KEY) {
-  console.warn('IMPORT_API_KEY is not set. /api/import will be unprotected.');
+
+function detectDelimiter(line: string) {
+  // BMO export is usually TSV
+  if (line.includes("\t")) return "\t";
+  if (line.includes(",")) return ",";
+  return "\t";
+}
+
+function parseDelimitedLine(line: string, delim: string): string[] {
+  // Minimal CSV/TSV parser with quote support
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (ch === '"') {
+      // handle doubled quotes inside quoted field
+      const next = line[i + 1];
+      if (inQuotes && next === '"') {
+        cur += '"';
+        i++;
+        continue;
+      }
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    if (!inQuotes && ch === delim) {
+      out.push(cur.trim());
+      cur = "";
+      continue;
+    }
+
+    cur += ch;
+  }
+
+  out.push(cur.trim());
+  return out;
+}
+
+function findHeader(lines: string[]) {
+  // Look for a line that contains all required columns, in any position
+  const required = [
+    "transaction type",
+    "date posted",
+    "transaction amount",
+    "description",
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = (lines[i] || "").trim();
+    if (!raw) continue;
+
+    const delim = detectDelimiter(raw);
+    const cols = parseDelimitedLine(raw, delim).map(norm);
+
+    const hasAll = required.every((r) => cols.includes(r));
+    if (!hasAll) continue;
+
+    return { headerIndex: i, delim, cols };
+  }
+
+  return null;
+}
+
+function pickIndex(cols: string[], name: string) {
+  return cols.findIndex((c) => c === norm(name));
 }
 
 export async function POST(req: Request) {
   try {
-    // ---- API key guard ----
-    const reqApiKey = req.headers.get('x-api-key') || '';
-    if (!IMPORT_API_KEY || reqApiKey !== IMPORT_API_KEY) {
-      return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
+    const IMPORT_API_KEY = process.env.IMPORT_API_KEY || "";
+    const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+    const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+    if (!SUPABASE_URL || !SERVICE_ROLE) {
+      return NextResponse.json(
+        { ok: false, error: "Missing Supabase server env vars" },
+        { status: 500 }
+      );
     }
 
-    // ---- parse body ----
-    const body = await req.json().catch(() => ({}));
-    // Accepts fields: date_raw, transaction_type, amount_raw, description
-    const {
-      date_raw = new Date().toISOString().split('T')[0],
-      transaction_type = 'Import',
-      amount_raw = '0',
-      description = 'Test import row'
-    } = body;
+    // Auth: accept API key via header OR body (keeps current /upload working)
+    const headerKey =
+      req.headers.get("x-import-api-key") ||
+      req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+      "";
 
-    // Build payload as array (supabase-rest expects array of objects for insert)
-    const payload = [{
-      date_raw: String(date_raw),
-      transaction_type: String(transaction_type),
-      amount_raw: String(amount_raw),
-      description: String(description)
-    }];
+    const body = (await req.json().catch(() => ({}))) as IncomingBody;
 
-    if (!SUPABASE_URL) {
-      return NextResponse.json({ ok: false, error: 'Supabase URL not configured' }, { status: 500 });
+    const bodyKey = (body.importApiKey || body.apiKey || "").trim();
+    const providedKey = (headerKey || bodyKey).trim();
+
+    if (!IMPORT_API_KEY || providedKey !== IMPORT_API_KEY) {
+      return NextResponse.json(
+        { ok: false, error: "Unauthorized (bad IMPORT_API_KEY)" },
+        { status: 401 }
+      );
     }
 
-    const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/staging_import`;
+    const content = (body.content || "").toString();
+    if (!content.trim()) {
+      return NextResponse.json(
+        { ok: false, error: "Missing file content" },
+        { status: 400 }
+      );
+    }
 
-    // Ensure header values are strings for TS; use Headers
-    const key = SERVICE_ROLE_KEY ?? '';
-    const headers = new Headers();
-    headers.set('Content-Type', 'application/json');
-    headers.set('apikey', key);
-    headers.set('Authorization', `Bearer ${key}`);
-    headers.set('Prefer', 'return=representation');
+    // Normalize newlines and split
+    const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
-    const r = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload)
+    // Find header anywhere
+    const header = findHeader(lines);
+    if (!header) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "Could not find header row. Expected columns: Transaction Type, Date Posted, Transaction Amount, Description",
+        },
+        { status: 400 }
+      );
+    }
+
+    const { headerIndex, delim, cols } = header;
+
+    const idxType = pickIndex(cols, "Transaction Type");
+    const idxDate = pickIndex(cols, "Date Posted");
+    const idxAmt = pickIndex(cols, "Transaction Amount");
+    const idxDesc = pickIndex(cols, "Description");
+
+    if (idxType < 0 || idxDate < 0 || idxAmt < 0 || idxDesc < 0) {
+      return NextResponse.json(
+        { ok: false, error: "Header detected but required columns missing" },
+        { status: 400 }
+      );
+    }
+
+    // Parse rows after header
+    const rowsToInsert: Array<{
+      date_raw: string;
+      transaction_type: string;
+      amount_raw: string;
+      description: string;
+      processed: boolean;
+    }> = [];
+
+    for (let i = headerIndex + 1; i < lines.length; i++) {
+      const raw = (lines[i] || "").trim();
+      if (!raw) continue;
+
+      const fields = parseDelimitedLine(raw, delim);
+
+      // Guard: some lines may be shorter
+      const tType = (fields[idxType] || "").trim();
+      const dPosted = (fields[idxDate] || "").trim();
+      const amt = (fields[idxAmt] || "").trim();
+
+      // Description sometimes includes extra tokens; join any remaining columns
+      let desc = (fields[idxDesc] || "").trim();
+      if (fields.length > idxDesc + 1) {
+        const tail = fields.slice(idxDesc + 1).join(" ").trim();
+        if (tail) desc = `${desc} ${tail}`.trim();
+      }
+
+      // Skip obvious non-data lines
+      if (!tType || !dPosted || !amt) continue;
+
+      rowsToInsert.push({
+        date_raw: dPosted,
+        transaction_type: tType.toUpperCase(),
+        amount_raw: amt,
+        description: desc || "Unknown",
+        processed: false,
+      });
+    }
+
+    if (rowsToInsert.length === 0) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "No data rows found after header",
+          headerIndex,
+        },
+        { status: 400 }
+      );
+    }
+
+    const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, {
+      auth: { persistSession: false },
     });
 
-    const text = await r.text();
-    let data: any;
-    try { data = JSON.parse(text); } catch (e) { data = text; }
+    // Insert in batches
+    const BATCH = 500;
+    let insertedCount = 0;
+    let firstInserted: any = null;
 
-    if (!r.ok) {
-      console.error('Supabase REST error', r.status, r.statusText, data);
-      return NextResponse.json({
-        ok: false,
-        status: r.status,
-        statusText: r.statusText,
-        body: data
-      }, { status: 500 });
+    for (let i = 0; i < rowsToInsert.length; i += BATCH) {
+      const batch = rowsToInsert.slice(i, i + BATCH);
+
+      const { data, error } = await supabase
+        .from("staging_import")
+        .insert(batch)
+        .select("id,date_raw,transaction_type,amount_raw,description,created_at,processed");
+
+      if (error) {
+        return NextResponse.json(
+          { ok: false, error: error.message, insertedCount },
+          { status: 500 }
+        );
+      }
+
+      insertedCount += (data || []).length;
+      if (!firstInserted && data && data.length > 0) firstInserted = data[0];
     }
 
-    // Inserted rows returned (representation). The staging trigger should then run.
-    return NextResponse.json({ ok: true, inserted: data }, { status: 200 });
-  } catch (err) {
-    console.error('Import handler error', err);
-    return NextResponse.json({ ok: false, error: 'server_error' }, { status: 500 });
+    return NextResponse.json({
+      ok: true,
+      filename: body.filename || null,
+      detected: {
+        delimiter: delim === "\t" ? "TAB" : "COMMA",
+        headerIndex,
+        headerColumns: cols,
+      },
+      inserted_count: insertedCount,
+      sample_inserted_row: firstInserted,
+    });
+  } catch (e: any) {
+    return NextResponse.json(
+      { ok: false, error: String(e?.message || e) },
+      { status: 500 }
+    );
   }
 }
