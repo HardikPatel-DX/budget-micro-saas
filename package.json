@@ -10,7 +10,7 @@
   "dependencies": {
     "@supabase/auth-helpers-nextjs": "^0.10.0",
     "@supabase/supabase-js": "^2.75.0",
-    "next": "15.5.4",
+    "next": "^16.1.1",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "recharts": "^3.2.1"
@@ -19,7 +19,8 @@
     "node": ">=18"
   },
   "devDependencies": {
-    "@types/node": "^24.7.2",
-    "@types/react": "^19.2.2"
+    "@types/node": "^25.0.3",
+    "@types/react": "^19.2.7",
+    "typescript": "^5.9.3"
   }
 }
