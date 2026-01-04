@@ -1,99 +1,116 @@
 // app/recurring/page.tsx
-'use client';
+"use client";
 
-import React, { useEffect, useState } from 'react';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import React, { useEffect, useMemo, useState } from "react";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-type RecurringRow = {
-  payee: string;
-  typical_amount_cad: number;
-  occurrences: number;
-  inferred_frequency: string;
-  last_observed_date: string | null;
-  next_expected_date: string | null;
-  estimated_monthly_cost: number;
+type RecRow = {
+  payee?: string | null;
+  typical_amount_cad?: number | null;
+  occurrences?: number | null;
+  inferred_frequency?: string | null;
+  last_observed_date?: string | null;
+  next_expected_date?: string | null;
+  estimated_monthly_cost?: number | null;
 };
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+function getSupabaseBrowserClient(): SupabaseClient | null {
+  if (typeof window === "undefined") return null;
 
-if (!supabaseUrl || !supabaseKey) {
-  // Will surface an obvious error in the browser if env-vars not set
-  console.error('Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY');
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !anon) return null;
+
+  return createClient(url, anon);
 }
 
-const supabase: SupabaseClient = createClient(supabaseUrl, supabaseKey);
-
 export default function RecurringPage() {
-  const [rows, setRows] = useState<RecurringRow[] | null>(null);
+  const supabase = useMemo(() => getSupabaseBrowserClient(), []);
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
+  const [rows, setRows] = useState<RecRow[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let mounted = true;
-    (async () => {
+    async function run() {
       try {
+        setLoading(true);
+        setError(null);
+
+        if (!supabase) {
+          setError("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY.");
+          setLoading(false);
+          return;
+        }
+
+        // NOTE: RLS is currently off in your DB, so this will read all rows.
+        // We will fix multi-user + RLS later, after CSV import pipeline is fully locked.
         const { data, error } = await supabase
-  .from('recurring_summary')
-  .select('*')
-  .order('estimated_monthly_cost', { ascending: false })
-  .limit(100);
-
-// optional: if you want to use the RecurringRow type for TS checks below
-const rows = data as RecurringRow[] | null;
-
+          .from("recurring_summary")
+          .select(
+            "payee,typical_amount_cad,occurrences,inferred_frequency,last_observed_date,next_expected_date,estimated_monthly_cost"
+          )
+          .order("estimated_monthly_cost", { ascending: false })
+          .limit(200);
 
         if (error) throw error;
-        if (mounted) setRows(data ?? []);
+        setRows((data as any) || []);
       } catch (e: any) {
-        console.error(e);
-        if (mounted) setErr(e.message || String(e));
+        setError(String(e?.message || e));
       } finally {
-        if (mounted) setLoading(false);
+        setLoading(false);
       }
-    })();
-    return () => { mounted = false; };
-  }, []);
+    }
+
+    run();
+  }, [supabase]);
 
   return (
-    <main style={{ padding: 20, fontFamily: 'Inter, system-ui, sans-serif' }}>
-      <h1>Recurring summary (MVP)</h1>
-      <p>
-        This page reads <code>public.recurring_summary</code> from Supabase using your
-        <code>NEXT_PUBLIC_SUPABASE_*</code> env vars.
-      </p>
+    <main style={{ maxWidth: 980, margin: "0 auto", padding: 24, fontFamily: "system-ui, Arial" }}>
+      <h1 style={{ marginTop: 0 }}>Recurring</h1>
 
       {loading && <p>Loading…</p>}
-      {err && <div style={{ color: 'crimson' }}><strong>Error:</strong> {err}</div>}
 
-      {!loading && !err && rows && rows.length === 0 && <p>No recurring rows found.</p>}
+      {!loading && error && (
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+          <strong>Error</strong>
+          <div style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{error}</div>
+        </div>
+      )}
 
-      {!loading && !err && rows && rows.length > 0 && (
-        <div style={{ overflowX: 'auto', marginTop: 12 }}>
-          <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 720 }}>
-            <thead style={{ textAlign: 'left', borderBottom: '1px solid #ddd' }}>
+      {!loading && !error && (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
               <tr>
-                <th style={{ padding: 8 }}>Payee</th>
-                <th style={{ padding: 8 }}>Typical</th>
-                <th style={{ padding: 8 }}>Occur</th>
-                <th style={{ padding: 8 }}>Freq</th>
-                <th style={{ padding: 8 }}>Last</th>
-                <th style={{ padding: 8 }}>Next</th>
-                <th style={{ padding: 8 }}>Est / month</th>
+                <th style={th}>Payee</th>
+                <th style={th}>Typical</th>
+                <th style={th}>Occurrences</th>
+                <th style={th}>Frequency</th>
+                <th style={th}>Last</th>
+                <th style={th}>Next</th>
+                <th style={th}>Monthly Est</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((r, i) => (
-                <tr key={i} style={{ borderBottom: '1px solid #f0f0f0' }}>
-                  <td style={{ padding: 8 }}>{r.payee}</td>
-                  <td style={{ padding: 8 }}>{Number(r.typical_amount_cad).toFixed(2)}</td>
-                  <td style={{ padding: 8 }}>{r.occurrences}</td>
-                  <td style={{ padding: 8 }}>{r.inferred_frequency}</td>
-                  <td style={{ padding: 8 }}>{r.last_observed_date ?? '—'}</td>
-                  <td style={{ padding: 8 }}>{r.next_expected_date ?? '—'}</td>
-                  <td style={{ padding: 8 }}>{Number(r.estimated_monthly_cost).toFixed(2)}</td>
+                <tr key={`${r.payee || "unknown"}-${i}`}>
+                  <td style={td}>{r.payee || "Unknown"}</td>
+                  <td style={td}>{fmt(r.typical_amount_cad)}</td>
+                  <td style={td}>{r.occurrences ?? ""}</td>
+                  <td style={td}>{r.inferred_frequency || ""}</td>
+                  <td style={td}>{r.last_observed_date || ""}</td>
+                  <td style={td}>{r.next_expected_date || ""}</td>
+                  <td style={td}>{fmt(r.estimated_monthly_cost)}</td>
                 </tr>
               ))}
+
+              {rows.length === 0 && (
+                <tr>
+                  <td style={td} colSpan={7}>
+                    No recurring rows found.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -101,3 +118,23 @@ const rows = data as RecurringRow[] | null;
     </main>
   );
 }
+
+function fmt(v: any) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "";
+  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+const th: React.CSSProperties = {
+  textAlign: "left",
+  fontSize: 12,
+  color: "#555",
+  borderBottom: "1px solid #ddd",
+  padding: "10px 8px",
+};
+
+const td: React.CSSProperties = {
+  borderBottom: "1px solid #eee",
+  padding: "10px 8px",
+  fontSize: 13,
+};
