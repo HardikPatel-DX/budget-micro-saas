@@ -249,9 +249,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const recent90 = new Date(Date.now() - 90 * 24 * 3600 * 1000);
       const byPayee = new Map<string, any[]>();
       transactions.filter(t => (t.date as Date) >= recent90).forEach(t => {
-        const k = (t.payee || 'Unknown') as string;
-        if (!byPayee.has(k)) byPayee.set(k, []);
-        byPayee.get(k).push(t);
+        const k = (t.payee || "Unknown") as string;
+const existing = byPayee.get(k);
+if (existing) {
+  existing.push(t);
+} else {
+  byPayee.set(k, [t]);
+}
+
       });
       const heuristics: RecurringOut[] = [];
       for (const [payee, arr] of byPayee.entries()) {
