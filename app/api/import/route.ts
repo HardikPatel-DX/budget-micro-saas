@@ -61,10 +61,9 @@ function findHeader(lines: string[]) {
     const delim = detectDelimiter(raw);
     const cols = parseDelimitedLine(raw, delim).map(norm);
 
-    const hasAll = required.every((r) => cols.includes(r));
-    if (!hasAll) continue;
-
-    return { headerIndex: i, delim, cols };
+    if (required.every((r) => cols.includes(r))) {
+      return { headerIndex: i, delim, cols };
+    }
   }
 
   return null;
@@ -75,7 +74,6 @@ function pickIndex(cols: string[], name: string) {
 }
 
 function parseBmoDateToISO(dateRaw: string): string | null {
-  // BMO export often gives YYYYMMDD (like 20250711)
   const s = (dateRaw || "").trim();
   if (!s) return null;
 
@@ -98,7 +96,7 @@ function parseBmoDateToISO(dateRaw: string): string | null {
     return `${yyyy}-${m}-${d}`;
   }
 
-  // Last resort: try Date parsing
+  // Last resort
   const dt = new Date(s);
   if (Number.isNaN(dt.getTime())) return null;
   return dt.toISOString().slice(0, 10);
@@ -108,21 +106,18 @@ function parseAmount(amountRaw: string): number | null {
   const s = (amountRaw || "").toString().trim();
   if (!s) return null;
 
-  // remove commas and currency symbols
   const cleaned = s.replace(/[$,]/g, "");
   const n = Number(cleaned);
-  if (!Number.isFinite(n)) return null;
-  return n;
+  return Number.isFinite(n) ? n : null;
 }
 
 function cleanPayee(description: string): string {
   const s = (description || "").trim();
   if (!s) return "Unknown";
 
-  // Basic cleanup for MVP
   return s
     .replace(/\s+/g, " ")
-    .replace(/^\[.*?\]\s*/g, "") // strip leading [DN] etc
+    .replace(/^\[.*?\]\s*/g, "")
     .trim()
     .slice(0, 180);
 }
@@ -146,6 +141,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "Missing Supabase server env vars" }, { status: 500 });
     }
 
+    // Your UI sends: header "x-api-key"
     const headerKey =
       req.headers.get("x-api-key") ||
       req.headers.get("x-import-api-key") ||
@@ -231,44 +227,37 @@ export async function POST(req: Request) {
 
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } });
 
-    // 1) Insert staging rows
+    // 1) Insert staging rows and capture inserted IDs so processing is deterministic
     const BATCH = 500;
     let insertedCount = 0;
+    const insertedStage: any[] = [];
 
     for (let i = 0; i < rowsToInsert.length; i += BATCH) {
       const batch = rowsToInsert.slice(i, i + BATCH);
-      const { error } = await supabase.from("staging_import").insert(batch);
-      if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+
+      const { data, error } = await supabase
+        .from("staging_import")
+        .insert(batch)
+        .select("id,date_raw,transaction_type,amount_raw,description,processed");
+
+      if (error) {
+        return NextResponse.json({ ok: false, error: error.message, inserted_count: insertedCount }, { status: 500 });
+      }
+
       insertedCount += batch.length;
+      if (data && data.length) insertedStage.push(...data);
     }
 
-    // 2) Select recent unprocessed staging rows (avoid reprocessing old uploads)
-    const sinceIso = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-    const { data: stagingRows, error: stageErr } = await supabase
-      .from("staging_import")
-      .select("id,date_raw,transaction_type,amount_raw,description,created_at,processed")
-      .eq("processed", false)
-      .gte("created_at", sinceIso)
-      .order("id", { ascending: true })
-      .limit(10000);
-
-    if (stageErr) return NextResponse.json({ ok: false, error: stageErr.message }, { status: 500 });
-
-    const stage = (stagingRows || []) as any[];
-    if (stage.length === 0) {
-      return NextResponse.json({
-        ok: true,
-        filename: body.filename || null,
-        detected: { delimiter: delim === "\t" ? "TAB" : "COMMA", headerIndex, headerColumns: cols },
-        inserted_count: insertedCount,
-        processed_count: 0,
-        note: "No recent unprocessed staging rows found to process.",
-      });
+    if (insertedStage.length === 0) {
+      return NextResponse.json(
+        { ok: false, error: "Inserted staging rows but got no rows back from INSERT RETURNING." },
+        { status: 500 }
+      );
     }
 
-    // 3) Transform into transactions (MVP rules)
-    const txToInsert = stage
-      .map((r) => {
+    // 2) Transform inserted staging rows into transactions
+    const txToInsert = insertedStage
+      .map((r: any) => {
         const iso = parseBmoDateToISO(r.date_raw);
         const amtNum = parseAmount(r.amount_raw);
         if (!iso || amtNum === null) return null;
@@ -278,9 +267,9 @@ export async function POST(req: Request) {
 
         return {
           date: iso,
-          transaction_type: (r.transaction_type || "").toString(),
+          transaction_type: String(r.transaction_type || ""),
           amount: amtNum,
-          description: (r.description || "").toString(),
+          description: String(r.description || ""),
           payee_clean: payeeClean,
           payee_norm: payeeN,
           category: "Uncategorized",
@@ -300,36 +289,73 @@ export async function POST(req: Request) {
       return NextResponse.json(
         {
           ok: false,
-          error: "Staging rows found but none could be parsed into valid transactions (date/amount parsing failed).",
+          error: "Staging inserted but none could be parsed into transactions. Date or amount parsing failed.",
           inserted_count: insertedCount,
-          staging_found: stage.length,
+          inserted_stage: insertedStage.length,
         },
         { status: 400 }
       );
     }
 
-    // 4) Insert transactions
-    const { data: insertedTx, error: txErr } = await supabase
-      .from("transactions")
-      .insert(txToInsert)
-      .select("id,source_staging_id")
-      .limit(20);
+    // 3) Insert transactions (batch insert)
+    const insertedTxSample: any[] = [];
+    let processedCount = 0;
 
-    if (txErr) return NextResponse.json({ ok: false, error: txErr.message }, { status: 500 });
+    for (let i = 0; i < txToInsert.length; i += BATCH) {
+      const batch = txToInsert.slice(i, i + BATCH);
 
-    // 5) Mark staging rows processed
-    const ids = txToInsert.map((t) => t.source_staging_id).filter(Boolean);
-    const { error: updErr } = await supabase.from("staging_import").update({ processed: true }).in("id", ids);
-    if (updErr) return NextResponse.json({ ok: false, error: updErr.message }, { status: 500 });
+      const { data, error } = await supabase
+        .from("transactions")
+        .insert(batch)
+        .select("id,source_staging_id")
+        .limit(20);
+
+      if (error) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: error.message,
+            inserted_count: insertedCount,
+            processed_count: processedCount,
+          },
+          { status: 500 }
+        );
+      }
+
+      processedCount += batch.length;
+      if (data && data.length && insertedTxSample.length < 20) {
+        insertedTxSample.push(...data.slice(0, 20 - insertedTxSample.length));
+      }
+    }
+
+    // 4) Mark exactly those staging rows as processed
+    const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
+    const { error: updErr } = await supabase.from("staging_import").update({ processed: true }).in("id", stageIds);
+
+    if (updErr) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: updErr.message,
+          inserted_count: insertedCount,
+          processed_count: processedCount,
+        },
+        { status: 500 }
+      );
+    }
 
     return NextResponse.json({
       ok: true,
       filename: body.filename || null,
-      detected: { delimiter: delim === "\t" ? "TAB" : "COMMA", headerIndex, headerColumns: cols },
+      detected: {
+        delimiter: delim === "\t" ? "TAB" : "COMMA",
+        headerIndex,
+        headerColumns: cols,
+      },
       inserted_count: insertedCount,
-      staging_selected: stage.length,
-      processed_count: txToInsert.length,
-      sample_transactions: insertedTx || [],
+      processed_count: processedCount,
+      sample_transactions: insertedTxSample,
+      sample_stage_ids: stageIds.slice(0, 10),
     });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
