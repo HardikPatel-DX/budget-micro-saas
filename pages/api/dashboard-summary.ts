@@ -386,7 +386,7 @@ export default async function handler(
 
     // Savings scenarios
     const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(now.get-date ? now.getDate() - 7 : now.getDate() - 7); // safety for TS inference
+    sevenDaysAgo.setDate(now.getDate() - 7); // safety for TS inference
 
     const weeklyNetFlow = transactions
       .filter((t: any) => t.date && (t.date as Date) >= sevenDaysAgo)
