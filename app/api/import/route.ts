@@ -110,12 +110,7 @@ function parseAmount(amountRaw: string): number | null {
 function cleanPayee(description: string): string {
   const s = (description || "").trim();
   if (!s) return "Unknown";
-
-  return s
-    .replace(/\s+/g, " ")
-    .replace(/^\[.*?\]\s*/g, "")
-    .trim()
-    .slice(0, 180);
+  return s.replace(/\s+/g, " ").replace(/^\[.*?\]\s*/g, "").trim().slice(0, 180);
 }
 
 function normPayee(payee: string): string {
@@ -144,7 +139,6 @@ export async function POST(req: Request) {
       "";
 
     const body = (await req.json().catch(() => ({}))) as IncomingBody;
-
     const bodyKey = (body.importApiKey || body.apiKey || "").trim();
     const providedKey = (headerKey || bodyKey).trim();
 
@@ -222,7 +216,7 @@ export async function POST(req: Request) {
 
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } });
 
-    // Insert staging rows and capture IDs
+    // 1) Insert staging rows and capture IDs
     const BATCH = 500;
     let insertedCount = 0;
     const insertedStage: any[] = [];
@@ -243,8 +237,8 @@ export async function POST(req: Request) {
       if (data && data.length) insertedStage.push(...data);
     }
 
-    // Transform
-    const txToUpsert = insertedStage
+    // 2) Build candidate transactions
+    const candidates = insertedStage
       .map((r: any) => {
         const iso = parseBmoDateToISO(r.date_raw);
         const amtNum = parseAmount(r.amount_raw);
@@ -273,24 +267,40 @@ export async function POST(req: Request) {
       })
       .filter(Boolean) as any[];
 
-    if (txToUpsert.length === 0) {
+    if (candidates.length === 0) {
       return NextResponse.json(
         { ok: false, error: "Inserted staging rows but none could be parsed into transactions.", inserted_count: insertedCount },
         { status: 400 }
       );
     }
 
-    // Upsert into transactions by unique key (source_staging_id)
-    // This prevents duplicate key failures on re-upload/retry.
+    // 3) Dedupe without relying on DB constraints: only insert missing source_staging_id
+    const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
+
+    const existing = await supabase
+      .from("transactions")
+      .select("source_staging_id")
+      .in("source_staging_id", stageIds);
+
+    if (existing.error) {
+      return NextResponse.json(
+        { ok: false, error: existing.error.message, inserted_count: insertedCount, processed_count: 0 },
+        { status: 500 }
+      );
+    }
+
+    const existingSet = new Set((existing.data || []).map((x: any) => x.source_staging_id));
+    const toInsert = candidates.filter((t: any) => !existingSet.has(t.source_staging_id));
+
     let processedCount = 0;
     const sample: any[] = [];
 
-    for (let i = 0; i < txToUpsert.length; i += BATCH) {
-      const batch = txToUpsert.slice(i, i + BATCH);
+    for (let i = 0; i < toInsert.length; i += BATCH) {
+      const batch = toInsert.slice(i, i + BATCH);
 
       const { data, error } = await supabase
         .from("transactions")
-        .upsert(batch, { onConflict: "source_staging_id" })
+        .insert(batch)
         .select("id,source_staging_id")
         .limit(20);
 
@@ -307,8 +317,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // Mark staging rows processed
-    const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
+    // 4) Mark all inserted staging rows processed (even if tx already existed)
     const { error: updErr } = await supabase.from("staging_import").update({ processed: true }).in("id", stageIds);
 
     if (updErr) {
@@ -324,6 +333,7 @@ export async function POST(req: Request) {
       detected: { delimiter: delim === "\t" ? "TAB" : "COMMA", headerIndex, headerColumns: cols },
       inserted_count: insertedCount,
       processed_count: processedCount,
+      skipped_existing_count: candidates.length - toInsert.length,
       sample_transactions: sample,
     });
   } catch (e: any) {
