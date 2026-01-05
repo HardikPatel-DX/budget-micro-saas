@@ -61,9 +61,7 @@ function findHeader(lines: string[]) {
     const delim = detectDelimiter(raw);
     const cols = parseDelimitedLine(raw, delim).map(norm);
 
-    if (required.every((r) => cols.includes(r))) {
-      return { headerIndex: i, delim, cols };
-    }
+    if (required.every((r) => cols.includes(r))) return { headerIndex: i, delim, cols };
   }
 
   return null;
@@ -78,19 +76,13 @@ function parseBmoDateToISO(dateRaw: string): string | null {
   if (!s) return null;
 
   if (/^\d{8}$/.test(s)) {
-    const y = s.slice(0, 4);
-    const m = s.slice(4, 6);
-    const d = s.slice(6, 8);
-    return `${y}-${m}-${d}`;
+    return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
   }
-
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
 
   if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
     const [mm, dd, yyyy] = s.split("/");
-    const m = mm.padStart(2, "0");
-    const d = dd.padStart(2, "0");
-    return `${yyyy}-${m}-${d}`;
+    return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
   }
 
   const dt = new Date(s);
@@ -274,13 +266,10 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3) Dedupe without relying on DB constraints: only insert missing source_staging_id
+    // 3) Dedupe: only insert missing source_staging_id
     const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
 
-    const existing = await supabase
-      .from("transactions")
-      .select("source_staging_id")
-      .in("source_staging_id", stageIds);
+    const existing = await supabase.from("transactions").select("source_staging_id").in("source_staging_id", stageIds);
 
     if (existing.error) {
       return NextResponse.json(
@@ -298,11 +287,7 @@ export async function POST(req: Request) {
     for (let i = 0; i < toInsert.length; i += BATCH) {
       const batch = toInsert.slice(i, i + BATCH);
 
-      const { data, error } = await supabase
-        .from("transactions")
-        .insert(batch)
-        .select("id,source_staging_id")
-        .limit(20);
+      const { data, error } = await supabase.from("transactions").insert(batch).select("id,source_staging_id").limit(20);
 
       if (error) {
         return NextResponse.json(
@@ -312,12 +297,10 @@ export async function POST(req: Request) {
       }
 
       processedCount += batch.length;
-      if (data && data.length && sample.length < 20) {
-        sample.push(...data.slice(0, 20 - sample.length));
-      }
+      if (data && data.length && sample.length < 20) sample.push(...data.slice(0, 20 - sample.length));
     }
 
-    // 4) Mark all inserted staging rows processed (even if tx already existed)
+    // 4) Mark staging processed (even if skipped)
     const { error: updErr } = await supabase.from("staging_import").update({ processed: true }).in("id", stageIds);
 
     if (updErr) {
