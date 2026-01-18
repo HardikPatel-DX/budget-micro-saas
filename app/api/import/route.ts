@@ -63,7 +63,6 @@ function findHeader(lines: string[]) {
 
     if (required.every((r) => cols.includes(r))) return { headerIndex: i, delim, cols };
   }
-
   return null;
 }
 
@@ -75,11 +74,13 @@ function parseBmoDateToISO(dateRaw: string): string | null {
   const s = (dateRaw || "").trim();
   if (!s) return null;
 
-  if (/^\d{8}$/.test(s)) {
-    return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
-  }
+  // YYYYMMDD
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+
+  // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
 
+  // MM/DD/YYYY
   if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
     const [mm, dd, yyyy] = s.split("/");
     return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
@@ -208,7 +209,7 @@ export async function POST(req: Request) {
 
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } });
 
-    // 1) Insert staging rows and capture IDs
+    // 1) Insert staging rows and capture IDs (deterministic processing)
     const BATCH = 500;
     let insertedCount = 0;
     const insertedStage: any[] = [];
@@ -229,7 +230,29 @@ export async function POST(req: Request) {
       if (data && data.length) insertedStage.push(...data);
     }
 
-    // 2) Build candidate transactions
+    const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
+
+    // 2) RESET-FRIENDLY: delete existing transactions for these staging IDs
+    let deletedExistingTxCount = 0;
+    for (let i = 0; i < stageIds.length; i += BATCH) {
+      const batchIds = stageIds.slice(i, i + BATCH);
+      const { data, error } = await supabase
+        .from("transactions")
+        .delete()
+        .in("source_staging_id", batchIds)
+        .select("id"); // return deleted ids so we can count
+
+      if (error) {
+        return NextResponse.json(
+          { ok: false, error: error.message, inserted_count: insertedCount, deleted_existing_tx_count: deletedExistingTxCount },
+          { status: 500 }
+        );
+      }
+
+      deletedExistingTxCount += (data || []).length;
+    }
+
+    // 3) Transform inserted staging rows into transactions
     const candidates = insertedStage
       .map((r: any) => {
         const iso = parseBmoDateToISO(r.date_raw);
@@ -261,37 +284,38 @@ export async function POST(req: Request) {
 
     if (candidates.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "Inserted staging rows but none could be parsed into transactions.", inserted_count: insertedCount },
+        {
+          ok: false,
+          error: "Inserted staging rows but none could be parsed into transactions (date/amount parsing failed).",
+          inserted_count: insertedCount,
+          deleted_existing_tx_count: deletedExistingTxCount,
+        },
         { status: 400 }
       );
     }
 
-    // 3) Dedupe: only insert missing source_staging_id
-    const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
-
-    const existing = await supabase.from("transactions").select("source_staging_id").in("source_staging_id", stageIds);
-
-    if (existing.error) {
-      return NextResponse.json(
-        { ok: false, error: existing.error.message, inserted_count: insertedCount, processed_count: 0 },
-        { status: 500 }
-      );
-    }
-
-    const existingSet = new Set((existing.data || []).map((x: any) => x.source_staging_id));
-    const toInsert = candidates.filter((t: any) => !existingSet.has(t.source_staging_id));
-
+    // 4) Insert transactions fresh
     let processedCount = 0;
     const sample: any[] = [];
 
-    for (let i = 0; i < toInsert.length; i += BATCH) {
-      const batch = toInsert.slice(i, i + BATCH);
+    for (let i = 0; i < candidates.length; i += BATCH) {
+      const batch = candidates.slice(i, i + BATCH);
 
-      const { data, error } = await supabase.from("transactions").insert(batch).select("id,source_staging_id").limit(20);
+      const { data, error } = await supabase
+        .from("transactions")
+        .insert(batch)
+        .select("id,source_staging_id")
+        .limit(20);
 
       if (error) {
         return NextResponse.json(
-          { ok: false, error: error.message, inserted_count: insertedCount, processed_count: processedCount },
+          {
+            ok: false,
+            error: error.message,
+            inserted_count: insertedCount,
+            deleted_existing_tx_count: deletedExistingTxCount,
+            processed_count: processedCount,
+          },
           { status: 500 }
         );
       }
@@ -300,12 +324,18 @@ export async function POST(req: Request) {
       if (data && data.length && sample.length < 20) sample.push(...data.slice(0, 20 - sample.length));
     }
 
-    // 4) Mark staging processed (even if skipped)
+    // 5) Mark staging rows processed
     const { error: updErr } = await supabase.from("staging_import").update({ processed: true }).in("id", stageIds);
 
     if (updErr) {
       return NextResponse.json(
-        { ok: false, error: updErr.message, inserted_count: insertedCount, processed_count: processedCount },
+        {
+          ok: false,
+          error: updErr.message,
+          inserted_count: insertedCount,
+          deleted_existing_tx_count: deletedExistingTxCount,
+          processed_count: processedCount,
+        },
         { status: 500 }
       );
     }
@@ -313,10 +343,14 @@ export async function POST(req: Request) {
     return NextResponse.json({
       ok: true,
       filename: body.filename || null,
-      detected: { delimiter: delim === "\t" ? "TAB" : "COMMA", headerIndex, headerColumns: cols },
+      detected: {
+        delimiter: delim === "\t" ? "TAB" : "COMMA",
+        headerIndex,
+        headerColumns: cols,
+      },
       inserted_count: insertedCount,
+      deleted_existing_tx_count: deletedExistingTxCount,
       processed_count: processedCount,
-      skipped_existing_count: candidates.length - toInsert.length,
       sample_transactions: sample,
     });
   } catch (e: any) {
