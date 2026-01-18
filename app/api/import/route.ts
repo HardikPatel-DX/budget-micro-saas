@@ -10,9 +10,14 @@ type IncomingBody = {
 };
 
 type MappingRow = { pattern: string; normalized: string; category: string };
+type CompiledMap = { patRaw: string; patNorm: string; normalized: string; category: string };
 
 function norm(s: string) {
   return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+function toAlnumUpper(s: string) {
+  return (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 function detectDelimiter(line: string) {
@@ -113,21 +118,39 @@ function normPayee(payee: string): string {
     .slice(0, 180);
 }
 
-function applyMapping(description: string, mappings: MappingRow[]) {
-  const hay = (description || "").toUpperCase();
+function compileMappings(rows: MappingRow[]): CompiledMap[] {
+  // Precompute normalized pattern once, and sort by pattern length desc (more specific first)
+  const compiled = (rows || [])
+    .map((r) => {
+      const patRaw = (r.pattern || "").trim();
+      const patNorm = toAlnumUpper(patRaw);
+      return {
+        patRaw,
+        patNorm,
+        normalized: (r.normalized || "").trim(),
+        category: (r.category || "").trim(),
+      };
+    })
+    .filter((m) => m.patNorm.length > 0);
 
-  for (const m of mappings) {
-    const pat = (m.pattern || "").toUpperCase().trim();
-    if (!pat) continue;
-    if (hay.includes(pat)) {
+  compiled.sort((a, b) => b.patNorm.length - a.patNorm.length);
+  return compiled;
+}
+
+function applyMapping(description: string, compiled: CompiledMap[]) {
+  const hay = toAlnumUpper(description);
+
+  for (const m of compiled) {
+    if (hay.includes(m.patNorm)) {
       return {
         category: m.category || "Uncategorized",
         normalized: m.normalized || "",
+        matched_pattern: m.patRaw,
       };
     }
   }
 
-  return { category: "Uncategorized", normalized: "" };
+  return { category: "Uncategorized", normalized: "", matched_pattern: "" };
 }
 
 export async function POST(req: Request) {
@@ -225,15 +248,13 @@ export async function POST(req: Request) {
     const { data: mappingRows, error: mapErr } = await supabase
       .from("payee_mapping")
       .select("pattern,normalized,category")
-      .limit(2000);
+      .limit(5000);
 
-    if (mapErr) {
-      return NextResponse.json({ ok: false, error: mapErr.message }, { status: 500 });
-    }
+    if (mapErr) return NextResponse.json({ ok: false, error: mapErr.message }, { status: 500 });
 
-    const mappings = (mappingRows || []) as MappingRow[];
+    const compiled = compileMappings((mappingRows || []) as MappingRow[]);
 
-    // 1) Insert staging rows and capture IDs
+    // Insert staging rows and capture IDs
     const BATCH = 500;
     let insertedCount = 0;
     const insertedStage: any[] = [];
@@ -256,9 +277,8 @@ export async function POST(req: Request) {
 
     const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
 
-    // 2) Reset-friendly: delete existing transactions for these staging IDs
+    // Reset-friendly: delete existing tx for these stage IDs
     let deletedExistingTxCount = 0;
-
     for (let i = 0; i < stageIds.length; i += BATCH) {
       const batchIds = stageIds.slice(i, i + BATCH);
 
@@ -278,7 +298,7 @@ export async function POST(req: Request) {
       deletedExistingTxCount += (data || []).length;
     }
 
-    // 3) Transform + apply mapping
+    // Transform + apply mapping
     const candidates = insertedStage
       .map((r: any) => {
         const iso = parseBmoDateToISO(r.date_raw);
@@ -288,10 +308,8 @@ export async function POST(req: Request) {
         const rawDesc = String(r.description || "");
         const basePayeeClean = cleanPayee(rawDesc);
 
-        const mapped = applyMapping(rawDesc, mappings);
+        const mapped = applyMapping(rawDesc, compiled);
         const finalPayeeClean = mapped.normalized ? mapped.normalized : basePayeeClean;
-        const finalPayeeNorm = normPayee(finalPayeeClean);
-        const finalCategory = mapped.category || "Uncategorized";
 
         return {
           date: iso,
@@ -299,12 +317,12 @@ export async function POST(req: Request) {
           amount: amtNum,
           description: rawDesc,
           payee_clean: finalPayeeClean,
-          payee_norm: finalPayeeNorm,
-          category: finalCategory,
+          payee_norm: normPayee(finalPayeeClean),
+          category: mapped.category || "Uncategorized",
           is_transfer: false,
           is_savings: false,
           likely_loc: false,
-          notes: null,
+          notes: mapped.matched_pattern ? `mapped:${mapped.matched_pattern}` : null,
           source_staging_id: r.id,
           date_parsed: iso,
           amount_num: amtNum,
@@ -315,17 +333,12 @@ export async function POST(req: Request) {
 
     if (candidates.length === 0) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "Inserted staging rows but none could be parsed into transactions (date/amount parsing failed).",
-          inserted_count: insertedCount,
-          deleted_existing_tx_count: deletedExistingTxCount,
-        },
+        { ok: false, error: "Inserted staging rows but none could be parsed into transactions.", inserted_count: insertedCount },
         { status: 400 }
       );
     }
 
-    // 4) Insert fresh transactions
+    // Insert fresh
     let processedCount = 0;
     const sample: any[] = [];
 
@@ -335,18 +348,12 @@ export async function POST(req: Request) {
       const { data, error } = await supabase
         .from("transactions")
         .insert(batch)
-        .select("id,source_staging_id,category,payee_clean")
+        .select("id,source_staging_id,category,payee_clean,notes")
         .limit(20);
 
       if (error) {
         return NextResponse.json(
-          {
-            ok: false,
-            error: error.message,
-            inserted_count: insertedCount,
-            deleted_existing_tx_count: deletedExistingTxCount,
-            processed_count: processedCount,
-          },
+          { ok: false, error: error.message, inserted_count: insertedCount, processed_count: processedCount },
           { status: 500 }
         );
       }
@@ -355,18 +362,11 @@ export async function POST(req: Request) {
       if (data && data.length && sample.length < 20) sample.push(...data.slice(0, 20 - sample.length));
     }
 
-    // 5) Mark staging rows processed
+    // Mark staging processed
     const { error: updErr } = await supabase.from("staging_import").update({ processed: true }).in("id", stageIds);
-
     if (updErr) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: updErr.message,
-          inserted_count: insertedCount,
-          deleted_existing_tx_count: deletedExistingTxCount,
-          processed_count: processedCount,
-        },
+        { ok: false, error: updErr.message, inserted_count: insertedCount, processed_count: processedCount },
         { status: 500 }
       );
     }
@@ -375,7 +375,7 @@ export async function POST(req: Request) {
       ok: true,
       filename: body.filename || null,
       detected: { delimiter: delim === "\t" ? "TAB" : "COMMA", headerIndex, headerColumns: cols },
-      mapping_count: mappings.length,
+      mapping_count: compiled.length,
       inserted_count: insertedCount,
       deleted_existing_tx_count: deletedExistingTxCount,
       processed_count: processedCount,
