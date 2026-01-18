@@ -9,6 +9,8 @@ type IncomingBody = {
   apiKey?: string;
 };
 
+type MappingRow = { pattern: string; normalized: string; category: string };
+
 function norm(s: string) {
   return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
 }
@@ -74,13 +76,9 @@ function parseBmoDateToISO(dateRaw: string): string | null {
   const s = (dateRaw || "").trim();
   if (!s) return null;
 
-  // YYYYMMDD
   if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
-
-  // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
 
-  // MM/DD/YYYY
   if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
     const [mm, dd, yyyy] = s.split("/");
     return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
@@ -113,6 +111,23 @@ function normPayee(payee: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 180);
+}
+
+function applyMapping(description: string, mappings: MappingRow[]) {
+  const hay = (description || "").toUpperCase();
+
+  for (const m of mappings) {
+    const pat = (m.pattern || "").toUpperCase().trim();
+    if (!pat) continue;
+    if (hay.includes(pat)) {
+      return {
+        category: m.category || "Uncategorized",
+        normalized: m.normalized || "",
+      };
+    }
+  }
+
+  return { category: "Uncategorized", normalized: "" };
 }
 
 export async function POST(req: Request) {
@@ -149,10 +164,7 @@ export async function POST(req: Request) {
     const header = findHeader(lines);
     if (!header) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "Could not find header row. Expected columns: Transaction Type, Date Posted, Transaction Amount, Description",
-        },
+        { ok: false, error: "Could not find header row. Expected: Transaction Type, Date Posted, Transaction Amount, Description" },
         { status: 400 }
       );
     }
@@ -209,7 +221,19 @@ export async function POST(req: Request) {
 
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } });
 
-    // 1) Insert staging rows and capture IDs (deterministic processing)
+    // Load mappings once
+    const { data: mappingRows, error: mapErr } = await supabase
+      .from("payee_mapping")
+      .select("pattern,normalized,category")
+      .limit(2000);
+
+    if (mapErr) {
+      return NextResponse.json({ ok: false, error: mapErr.message }, { status: 500 });
+    }
+
+    const mappings = (mappingRows || []) as MappingRow[];
+
+    // 1) Insert staging rows and capture IDs
     const BATCH = 500;
     let insertedCount = 0;
     const insertedStage: any[] = [];
@@ -232,15 +256,17 @@ export async function POST(req: Request) {
 
     const stageIds = insertedStage.map((r: any) => r.id).filter(Boolean);
 
-    // 2) RESET-FRIENDLY: delete existing transactions for these staging IDs
+    // 2) Reset-friendly: delete existing transactions for these staging IDs
     let deletedExistingTxCount = 0;
+
     for (let i = 0; i < stageIds.length; i += BATCH) {
       const batchIds = stageIds.slice(i, i + BATCH);
+
       const { data, error } = await supabase
         .from("transactions")
         .delete()
         .in("source_staging_id", batchIds)
-        .select("id"); // return deleted ids so we can count
+        .select("id");
 
       if (error) {
         return NextResponse.json(
@@ -252,24 +278,29 @@ export async function POST(req: Request) {
       deletedExistingTxCount += (data || []).length;
     }
 
-    // 3) Transform inserted staging rows into transactions
+    // 3) Transform + apply mapping
     const candidates = insertedStage
       .map((r: any) => {
         const iso = parseBmoDateToISO(r.date_raw);
         const amtNum = parseAmount(r.amount_raw);
         if (!iso || amtNum === null) return null;
 
-        const payeeClean = cleanPayee(r.description || "");
-        const payeeN = normPayee(payeeClean);
+        const rawDesc = String(r.description || "");
+        const basePayeeClean = cleanPayee(rawDesc);
+
+        const mapped = applyMapping(rawDesc, mappings);
+        const finalPayeeClean = mapped.normalized ? mapped.normalized : basePayeeClean;
+        const finalPayeeNorm = normPayee(finalPayeeClean);
+        const finalCategory = mapped.category || "Uncategorized";
 
         return {
           date: iso,
           transaction_type: String(r.transaction_type || ""),
           amount: amtNum,
-          description: String(r.description || ""),
-          payee_clean: payeeClean,
-          payee_norm: payeeN,
-          category: "Uncategorized",
+          description: rawDesc,
+          payee_clean: finalPayeeClean,
+          payee_norm: finalPayeeNorm,
+          category: finalCategory,
           is_transfer: false,
           is_savings: false,
           likely_loc: false,
@@ -294,7 +325,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 4) Insert transactions fresh
+    // 4) Insert fresh transactions
     let processedCount = 0;
     const sample: any[] = [];
 
@@ -304,7 +335,7 @@ export async function POST(req: Request) {
       const { data, error } = await supabase
         .from("transactions")
         .insert(batch)
-        .select("id,source_staging_id")
+        .select("id,source_staging_id,category,payee_clean")
         .limit(20);
 
       if (error) {
@@ -343,11 +374,8 @@ export async function POST(req: Request) {
     return NextResponse.json({
       ok: true,
       filename: body.filename || null,
-      detected: {
-        delimiter: delim === "\t" ? "TAB" : "COMMA",
-        headerIndex,
-        headerColumns: cols,
-      },
+      detected: { delimiter: delim === "\t" ? "TAB" : "COMMA", headerIndex, headerColumns: cols },
+      mapping_count: mappings.length,
       inserted_count: insertedCount,
       deleted_existing_tx_count: deletedExistingTxCount,
       processed_count: processedCount,
